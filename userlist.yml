@@ -1,0 +1,95 @@
+---
+- name: Listar usuários ativos e seus privilégios
+  hosts: all
+  gather_facts: yes
+
+  tasks:
+    - name: Obter usuários e grupos em sistemas Unix/Linux
+      block:
+        - name: Obter lista de usuários
+          shell: "getent passwd | cut -d: -f1,3,4"
+          register: unix_users
+          changed_when: false
+
+        - name: Obter lista de grupos
+          shell: "getent group | cut -d: -f1,3,4"
+          register: unix_groups
+          changed_when: false
+
+        - name: Obter usuários com sudo
+          shell: "getent group sudo wheel admin | cut -d: -f4"
+          register: unix_sudo_users
+          changed_when: false
+
+        - name: Processar informações de usuários Unix/Linux
+          set_fact:
+            processed_users: >-
+              {% set user_list = [] %}
+              {% for user in unix_users.stdout_lines %}
+              {% set user_info = user.split(':') %}
+              {% set user_groups = [] %}
+              {% for group in unix_groups.stdout_lines %}
+              {% if user_info[2] in group.split(':')[2].split(',') %}
+              {% set _ = user_groups.append(group.split(':')[0]) %}
+              {% endif %}
+              {% endfor %}
+              {% set is_admin = user_info[0] in unix_sudo_users.stdout.split(',') or user_info[1] == '0' %}
+              {% set _ = user_list.append({'username': user_info[0], 'uid': user_info[1], 'groups': user_groups, 'is_admin': is_admin}) %}
+              {% endfor %}
+              {{ user_list }}
+      when: ansible_os_family != "Windows"
+
+    - name: Obter usuários e grupos em sistemas Windows
+      block:
+        - name: Obter lista de usuários locais
+          win_shell: "Get-LocalUser | Select-Object Name, SID, Enabled | ConvertTo-Json"
+          register: win_users
+
+        - name: Obter lista de grupos locais
+          win_shell: "Get-LocalGroup | Select-Object Name, SID | ConvertTo-Json"
+          register: win_groups
+
+        - name: Obter membros do grupo Administradores
+          win_shell: "Get-LocalGroupMember -Group 'Administrators' | Select-Object Name | ConvertTo-Json"
+          register: win_admin_users
+
+        - name: Processar informações de usuários Windows
+          set_fact:
+            processed_users: >-
+              {% set user_list = [] %}
+              {% set users = win_users.stdout | from_json %}
+              {% set groups = win_groups.stdout | from_json %}
+              {% set admins = win_admin_users.stdout | from_json %}
+              {% for user in users %}
+              {% if user.Enabled %}
+              {% set user_groups = [] %}
+              {% for group in groups %}
+              {% set group_members = (lookup('win_shell', 'Get-LocalGroupMember -Group "' + group.Name + '" | Select-Object Name | ConvertTo-Json') | from_json) %}
+              {% if user.Name in group_members | map(attribute='Name') | list %}
+              {% set _ = user_groups.append(group.Name) %}
+              {% endif %}
+              {% endfor %}
+              {% set is_admin = user.Name in admins | map(attribute='Name') | list %}
+              {% set _ = user_list.append({'username': user.Name, 'sid': user.SID, 'groups': user_groups, 'is_admin': is_admin}) %}
+              {% endif %}
+              {% endfor %}
+              {{ user_list }}
+      when: ansible_os_family == "Windows"
+
+    - name: Exibir usuários e seus privilégios
+      debug:
+        msg: |
+          Usuários ativos em {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }}):
+          {% for user in processed_users %}
+          - Usuário: {{ user.username }}
+            {% if ansible_os_family != "Windows" %}
+            UID: {{ user.uid }}
+            {% else %}
+            SID: {{ user.sid }}
+            {% endif %}
+            Grupos: {{ user.groups | join(', ') }}
+            Administrador: {{ 'Sim' if user.is_admin else 'Não' }}
+            {% if user.is_admin %}
+            [DESTAQUE] Este usuário tem privilégios administrativos!
+            {% endif %}
+          {% endfor %}
